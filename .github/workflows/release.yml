@@ -1,0 +1,98 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: validate (tests + sim)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build test --summary all
+      - run: zig build -Doptimize=ReleaseSafe
+      - run: ./scripts/sim-check.sh zig-out/bin/usbdm
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-linux-gnu, runner: ubuntu-latest }
+          - { target: aarch64-linux-gnu, runner: ubuntu-latest }
+          - { target: x86_64-windows, runner: ubuntu-latest }
+          - { target: aarch64-windows, runner: ubuntu-latest }
+          - { target: aarch64-macos, runner: macos-15 }
+          - { target: x86_64-macos, runner: macos-15-intel }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: build
+        run: |
+          if [[ "${{ matrix.target }}" == *-macos ]]; then
+            zig build -Doptimize=ReleaseSafe
+          else
+            zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+          fi
+      - name: stage artifact
+        run: |
+          mkdir -p dist
+          bin=zig-out/bin/usbdm
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          out=dist/usbdm-${{ matrix.target }}
+          case "${{ matrix.target }}" in *windows*) out="$out.exe";; esac
+          cp "$bin" "$out"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: usbdm-${{ matrix.target }}
+          path: dist/*
+          retention-days: 1
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Versioned release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+      - name: Rolling "latest" release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          target_commitish: ${{ github.sha }}
+          name: "Latest (main)"
+          prerelease: true
+          make_latest: false
+          files: dist/*
+          body: |
+            Rolling build from the newest commit on `main`
+            (${{ github.sha }}).
+            For stable, versioned builds see the tagged releases.
