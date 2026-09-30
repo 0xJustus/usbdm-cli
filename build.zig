@@ -90,6 +90,9 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addAnonymousImport("flash_hcs12_gmmc", .{
         .root_source_file = b.path("vendor/flash-routines/HCS12-GMMC-FTMRG-flash-program.s19"),
     });
+    exe.root_module.addAnonymousImport("flash_hcs12_xmmc", .{
+        .root_source_file = b.path("vendor/flash-routines/HCS12-XMMC-XFTMRK-flash-program.s19"),
+    });
     exe.root_module.addAnonymousImport("flash_cfv1", .{
         .root_source_file = b.path("vendor/flash-routines/ColdfireV1-default-flash-program.elf.S19"),
     });

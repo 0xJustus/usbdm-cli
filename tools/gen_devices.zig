@@ -170,6 +170,7 @@ const SUP_HCS08 = [_][]const u8{ "HCS08-default-flash-program", "HCS08-small-fla
 const MMCV4 = [_][]const u8{ "HCS12-MMCV4-FTS-flash-program", "HCS12-MMCV4-FTS_2-flash-program", "HCS12-MMCV4-FTS_T-flash-program" };
 const GMMC = "HCS12-GMMC-FTMRG-flash-program";
 const GMMC_EE = "HCS12-GMMC-FTMRG-eeprom-program";
+const XMMC = "HCS12-XMMC-XFTMRK-flash-program";
 const SUP_CFV1 = [_][]const u8{ "CFV1-default-FlashProgram", "CFV1-Watchdog-FlashProgram" };
 
 fn inList(list: []const []const u8, s: []const u8) bool {
@@ -408,7 +409,7 @@ fn processFile(
 
         const supported = switch (fam) {
             .hcs08 => inList(&SUP_HCS08, rt),
-            .hcs12 => inList(&MMCV4, rt) or std.mem.eql(u8, rt, GMMC),
+            .hcs12 => inList(&MMCV4, rt) or std.mem.eql(u8, rt, GMMC) or std.mem.eql(u8, rt, XMMC),
             .cfv1 => inList(&SUP_CFV1, rt),
         };
         if (!supported) {
@@ -510,7 +511,8 @@ fn processFile(
         const flash_end2 = if (has_w2) merged[1].end else 0;
 
         const is_gmmc = fam == .hcs12 and std.mem.eql(u8, rt, GMMC);
-        const hcs12_routine: []const u8 = if (is_gmmc) "gmmc_ftmrg" else "mmcv4_fts";
+        const is_xmmc = fam == .hcs12 and std.mem.eql(u8, rt, XMMC);
+        const hcs12_routine: []const u8 = if (is_gmmc) "gmmc_ftmrg" else if (is_xmmc) "xmmc_xftmrk" else "mmcv4_fts";
         var have_paged = false;
         var pg_first: u64 = 0;
         var pg_last: u64 = 0;
@@ -521,8 +523,17 @@ fn processFile(
                 const pe = attr(b, "pageEnd");
                 if (pr != null and pe != null) {
                     saw_reset = true;
-                    const prv = parseNum(pr.?);
                     const pev = parseNum(pe.?);
+                    // MMCV4 entries give the lowest page as pageReset. XMMC ones give
+                    // the reset page (0xFE) and size the window with `pages` instead:
+                    // a byte size when >= 1024 (e.g. "1024K" -> 64 pages), else a count
+                    // (ref DeviceXmlParser memoryRange).
+                    const prv = if (is_xmmc) blk: {
+                        const pg = attr(b, "pages") orelse break :blk parseNum(pr.?);
+                        const n = parseNum(pg);
+                        const count = if (n >= 1024) n / 0x4000 else n;
+                        break :blk if (count >= 1 and count <= pev + 1) pev + 1 - count else parseNum(pr.?);
+                    } else parseNum(pr.?);
                     // paged only if pages exist below the top two fixed windows; else they cover all -> null
                     if (prv + 2 <= pev) {
                         have_paged = true;

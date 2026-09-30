@@ -49,16 +49,18 @@ behave as on-target. USB-only commands (`probe`/`version`/`list`) are declined.
 ## Flash programming
 
 Reference RAM flash-routine method: vendored routines run on the target CPU.
-Geometry (`--part`) comes from a build-time table of 188 parts (vendored USBDM
-device DB), which also backs `identify`. Families: HCS08/RS08, HCS12, CFV1, plus
-S12G EEPROM. Destructive commands confirm unless `--force`.
+Geometry (`--part`) comes from a build-time table of 193 parts (vendored USBDM
+device DB), which also backs `identify`. Families: HCS08/RS08, HCS12 (classic S12,
+S12G, and S12XE/XS/XF on the paged map), CFV1, plus S12G EEPROM. Destructive
+commands confirm unless `--force`. HCS12 flash operations start with a
+special-mode reset, so the target does not need to be halted first.
 
 ## GDB remote stub
 
 `usbdm gdb` serves the GDB remote protocol over TCP: registers, memory,
 single-step, `continue`/`vCont`, flash `load` (`vFlash*`), `monitor reset`/`halt`.
-Hardware breakpoints on HCS08, classic-S12 HCS12, and CFV1; S12G and watchpoints
-use GDB software breakpoints.
+Hardware breakpoints on HCS08, classic-S12 HCS12, and CFV1; S12G, S12X and
+watchpoints use GDB software breakpoints.
 
 ## Layout
 

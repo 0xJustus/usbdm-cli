@@ -6,8 +6,8 @@ const std = @import("std");
 /// Flash family - selects the RAM routine + ABI (HCS08 small-code, HCS12 large-code).
 pub const Family = enum { hcs08, hcs12, cfv1 };
 
-/// HCS12 routine: classic S12 = MMCV4/FTS, S12G = GMMC/FTMRG.
-pub const Hcs12Routine = enum { mmcv4_fts, gmmc_ftmrg };
+/// HCS12 routine: classic S12 = MMCV4/FTS, S12G = GMMC/FTMRG, S12XE = XMMC/XFTMRK.
+pub const Hcs12Routine = enum { mmcv4_fts, gmmc_ftmrg, xmmc_xftmrk };
 
 /// PPAGE-banked HCS12 flash. Window always 0x8000-0xBFFF; pages
 /// page_first..page_last map globally as (page << 16) | offset (routine sets

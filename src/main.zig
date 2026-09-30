@@ -546,6 +546,10 @@ fn runSim(
             sim.cpu = .{ .hcs08 = &hcs08_cpu };
         },
         .hcs12 => {
+            // No S12XE (XFTMRK) flash model: the FTS model would run the routine
+            // against the wrong controller and report a meaningless pass.
+            if (d.hcs12_routine == .xmmc_xftmrk)
+                fatalCode(.usage, "--sim has no S12XE (XFTMRK) flash model; '{s}' needs real hardware", .{d.name});
             hcs12_cpu = if (d.hcs12_routine == .gmmc_ftmrg)
                 lib.cpu12.Cpu.initGmmc(arena, d.flash_base) catch fatal("out of memory building the emulator", .{})
             else
@@ -1332,9 +1336,11 @@ const lib_device = lib.device;
 // Vendored HCS08 small-code routines (embedded). 0xB0 variant: RAM above 0x80.
 const flash_blob_80 = @embedFile("flash_hcs08_0x80");
 const flash_blob_b0 = @embedFile("flash_hcs08_0xB0");
-// Vendored HCS12 large-code routines. FTS = S12 MMCV4; GMMC = S12G FTMRG.
+// Vendored HCS12 large-code routines. FTS = S12 MMCV4; GMMC = S12G FTMRG;
+// XMMC = S12XE XFTMRK (same large-code ABI as GMMC).
 const flash_blob_hcs12_fts = @embedFile("flash_hcs12_fts");
 const flash_blob_hcs12_gmmc = @embedFile("flash_hcs12_gmmc");
+const flash_blob_hcs12_xmmc = @embedFile("flash_hcs12_xmmc");
 // Vendored CFV1 (ColdFire V1) large-code routine (32-bit ABI, relocatable-off).
 const flash_blob_cfv1 = @embedFile("flash_cfv1");
 
@@ -1555,6 +1561,14 @@ fn prepareFlash(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *
         fatal("--part '{s}' has a flash controller base 0x{x} that doesn't fit the {s} routine's 16-bit field", .{ d.name, d.flash_base, @tagName(d.family) });
     }
     bringUp(bdm, flags) catch |err| fatal("connect failed: {s}", .{@errorName(err)});
+    // HCS12: a target running its own code acks memory access but not a PC
+    // write (BDM_RC_ACK_TIMEOUT), so the routine cannot be started. Reset into
+    // special mode first, as the reference programmer does ("reset s h"): the
+    // CPU comes up halted in active BDM on its reset clock. Measure after this.
+    if (d.family == .hcs12) {
+        bdm.sess.reset(.special, .hardware) catch |err| fatal("special-mode reset failed: {s}", .{@errorName(err)});
+        bdm.sess.connect() catch |err| fatal("connect after reset failed: {s}", .{@errorName(err)});
+    }
     const bus_hz = flags.bus_hz orelse blk: {
         // sync==0: no measurement; sync==1: firmware "unknown" sentinel (syncToHz
         // clamps to ~4.3 GHz). Treat both as unknown, demand --bus-hz.
@@ -1564,7 +1578,41 @@ fn prepareFlash(arena: std.mem.Allocator, bdm: *Bdm, flags: *const Flags, out: *
         out.print("{s}using measured bus clock ~{d} kHz (override with --bus-hz){s}\n", .{ st.dim, hz / 1000, st.reset }) catch {};
         break :blk hz;
     };
+    if (d.family == .hcs12 and d.hcs12_routine == .xmmc_xftmrk) initXmmcFlash(bdm, d, bus_hz);
     return flashPrepFor(arena, d, bus_hz);
+}
+
+/// XFTMRK flash-clock divider for a bus clock in kHz, or null if no divider puts
+/// the flash clock in 800..1050 kHz. Clocked from OSCCLK = 2 x the special-mode
+/// bus clock (ref HCS12-XFTMRK-flash-scripts.tcl calculateFlashDivider).
+fn xmmcFlashDivider(bus_khz: u32) ?u8 {
+    if (bus_khz < 1000) return null;
+    const fm: f64 = 2.0 * @as(f64, @floatFromInt(bus_khz));
+    const div = @floor(fm / 1050.0 - 0.0001);
+    if (div < 0 or div > 0x3F) return null;
+    const flash_clk = fm / (div + 1.0);
+    if (flash_clk < 800 or flash_clk > 1050) return null;
+    return @intFromFloat(div);
+}
+
+/// The XFTMRK routine expects FCLKDIV already loaded (it reports an invalid
+/// divider otherwise), so do what the reference Tcl initTarget/initFlash do:
+/// disable COP, load FCLKDIV, unprotect P-flash and EEPROM.
+fn initXmmcFlash(bdm: *Bdm, d: lib_device.Device, bus_hz: u32) void {
+    const div = xmmcFlashDivider(bus_hz / 1000) orelse
+        fatal("no XFTMRK flash clock divider for a {d} kHz bus clock (needs 800..1050 kHz from 2x bus); check --bus-hz", .{bus_hz / 1000});
+    const base: u32 = d.flash_base;
+    const writes = [_]struct { addr: u32, val: u8 }{
+        .{ .addr = d.watchdog_addr, .val = 0x40 }, // COPCTL: COP off
+        .{ .addr = base + 0x00, .val = div }, // FCLKDIV
+        .{ .addr = base + 0x08, .val = 0xFF }, // FPROT: unprotected
+        .{ .addr = base + 0x09, .val = 0xFF }, // EPROT: unprotected
+    };
+    for (writes) |w| {
+        if (w.addr == 0) continue;
+        bdm.sess.writeMem(.byte, w.addr, &.{w.val}) catch |err|
+            fatal("XFTMRK flash init: write 0x{x:0>4} failed: {s}", .{ w.addr, @errorName(err) });
+    }
 }
 
 /// FlashPrep for a device at a known bus clock, no I/O (shared by prepareFlash + gdb).
@@ -1593,6 +1641,7 @@ fn flashPrepFor(arena: std.mem.Allocator, d: lib_device.Device, bus_hz: u32) Fla
             const blob = switch (d.hcs12_routine) {
                 .mmcv4_fts => flash_blob_hcs12_fts,
                 .gmmc_ftmrg => flash_blob_hcs12_gmmc,
+                .xmmc_xftmrk => flash_blob_hcs12_xmmc,
             };
             const routine = ramflash.parseLarge(arena, blob) catch |err|
                 fatal("cannot load HCS12 flash routine: {s}", .{@errorName(err)});
@@ -2405,6 +2454,24 @@ test "e2e HCS08: program -> readback -> blank-check(not blank) -> erase -> blank
     try drv.blankCheck(addr, d.page_size);
     try s.readMem(.byte, addr, &back);
     try std.testing.expectEqualSlices(u8, &.{ 0xFF, 0xFF, 0xFF, 0xFF }, &back);
+}
+
+test "XFTMRK flash divider matches the reference Tcl calculation" {
+    // 12 MHz OSCCLK board, measured in special mode: 5990 kHz -> 11 (~998 kHz).
+    try std.testing.expectEqual(@as(?u8, 11), xmmcFlashDivider(5990));
+    try std.testing.expectEqual(@as(?u8, 11), xmmcFlashDivider(6000));
+    try std.testing.expectEqual(@as(?u8, 15), xmmcFlashDivider(8000));
+    try std.testing.expectEqual(@as(?u8, null), xmmcFlashDivider(999));
+}
+
+test "parseLarge reads the vendored XFTMRK blob (same large-code ABI as GMMC)" {
+    const gpa = std.testing.allocator;
+    const r = try ramflash.parseLarge(gpa, flash_blob_hcs12_xmmc);
+    defer gpa.free(r.image);
+    try std.testing.expectEqual(@as(u32, 0x3000), r.image_address);
+    try std.testing.expect(r.capabilities & ramflash.CAP_RELOCATABLE != 0);
+    try std.testing.expect(r.capabilities & ramflash.CAP_DATA_FIXED == 0);
+    try std.testing.expect(r.entry > r.image_address and r.entry < r.image_address + r.image.len);
 }
 
 test "e2e HCS12: large-code program + verify + mass-erase via the sim" {

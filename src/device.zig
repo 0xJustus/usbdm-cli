@@ -101,6 +101,20 @@ test "generated HCS08 table: geometry and routine-blob selection" {
     try std.testing.expectEqual(@as(u32, 8), g240.write_align);
     try std.testing.expectEqual(@as(u32, 0x1400), g240.ram_start);
     try std.testing.expectEqual(@as(u32, 0x100), g240.eeprom.?.sector); // erase sector, not the XML phrase size
+    // S12XE: XMMC/XFTMRK, FTM at 0x0100, PPAGE-banked C0..FF from pages="1024K".
+    const xep = lookup("mc9s12xep100-family").?;
+    try std.testing.expectEqual(Hcs12Routine.xmmc_xftmrk, xep.hcs12_routine);
+    try std.testing.expectEqual(@as(u32, 0x0100), xep.flash_base);
+    try std.testing.expectEqual(@as(u32, 8), xep.write_align);
+    try std.testing.expectEqual(@as(u32, 1024), xep.page_size);
+    try std.testing.expectEqual(@as(u16, 0x0015), xep.paged.?.ppage_addr);
+    try std.testing.expectEqual(@as(u8, 0xC0), xep.paged.?.page_first);
+    try std.testing.expectEqual(@as(u8, 0xFF), xep.paged.?.page_last);
+    try std.testing.expect(xep.spanInFlash(0xFA8000, 0xFABFFF) and xep.spanInFlash(0xC000, 0xFFFF));
+    // Size-derived page count, not the 0xFE reset page: XS256 is 16 pages.
+    try std.testing.expectEqual(@as(u8, 0xF0), lookup("mc9s12xs256").?.paged.?.page_first);
+    // The linear-map entry stays out: its window is not reachable by the paged routine.
+    try std.testing.expect(lookup("mc9s12xep-linear") == null);
 }
 
 test "generated device table: known parts resolve with sane geometry" {
