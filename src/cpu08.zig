@@ -45,6 +45,13 @@ pub const Cpu = struct {
     flash_hi: u32,
     fstat: u8 = FCBEF | FCCF,
     fcmd: u8 = 0,
+    /// FCDIV: bit 7 DIVLD is set by the first write after reset, which also sets the
+    /// divider; later writes are ignored until the next reset (as the silicon does).
+    fcdiv: u8 = 0,
+    /// Model the flash controller refusing commands (FACCERR) until FCDIV is loaded.
+    /// Off for tests that drive the routine directly; on for the --sim CLI path, where
+    /// forgetting to load it is exactly the bug worth catching.
+    require_fcdiv: bool = false,
     latched: bool = false,
     latch_addr: u16 = 0,
     latch_data: u8 = 0,
@@ -90,7 +97,7 @@ pub const Cpu = struct {
         const a: u32 = addr;
         if (a >= self.ctrl_base and a <= self.ctrl_base + 6) {
             return switch (a - self.ctrl_base) {
-                FCDIV => 0x80, // DIVLD set
+                FCDIV => self.fcdiv,
                 FSTAT => self.fstat,
                 FCMD => self.fcmd,
                 else => 0,
@@ -115,16 +122,25 @@ pub const Cpu = struct {
     }
     fn flashRegWrite(self: *Cpu, off: u8, val: u8) void {
         switch (off) {
+            FCDIV => {
+                if (self.fcdiv & 0x80 == 0) self.fcdiv = (val & 0x7F) | 0x80;
+            },
             FCMD => self.fcmd = val,
             FSTAT => {
                 if (val & FACCERR != 0) self.fstat &= ~FACCERR;
                 if (val & FPVIOL != 0) self.fstat &= ~FPVIOL;
                 if (val & FCBEF != 0 and self.latched) self.launch();
             },
-            else => {}, // FCDIV/FOPT/FCNFG/FPROT: inert
+            else => {}, // FOPT/FCNFG/FPROT: inert
         }
     }
     fn launch(self: *Cpu) void {
+        if (self.require_fcdiv and self.fcdiv & 0x80 == 0) {
+            // Command with FCDIV unloaded: access error, nothing happens.
+            self.fstat = FCBEF | FCCF | FACCERR;
+            self.latched = false;
+            return;
+        }
         switch (self.fcmd) {
             CMD_BYTE_PROG, CMD_BURST_PROG => {
                 // program only clears bits; on erased flash a store
@@ -148,12 +164,27 @@ pub const Cpu = struct {
         self.latched = false;
     }
 
-    // BDM host access: direct, bypasses the controller
+    /// Reset the flash controller as a target reset does: FCDIV unloaded (DIVLD clear).
+    pub fn resetFlashRegs(self: *Cpu) void {
+        self.fcdiv = 0;
+        self.fstat = FCBEF | FCCF;
+        self.latched = false;
+    }
+
+    // BDM host access: direct to memory, but the flash controller's registers behave
+    // like registers (FCDIV is write-once), not like RAM.
     pub fn hostWrite(self: *Cpu, addr: u16, data: []const u8) void {
-        for (data, 0..) |b, i| self.mem[addr + i] = b;
+        for (data, 0..) |b, i| {
+            const a: u32 = @as(u32, addr) + @as(u32, @intCast(i));
+            if (a >= self.ctrl_base and a <= self.ctrl_base + 6) {
+                self.flashRegWrite(@intCast(a - self.ctrl_base), b);
+            } else {
+                self.mem[a] = b;
+            }
+        }
     }
     pub fn hostRead(self: *Cpu, addr: u16, out: []u8) void {
-        for (out, 0..) |*b, i| b.* = self.mem[addr + i];
+        for (out, 0..) |*b, i| b.* = self.read(@intCast(@as(u32, addr) + @as(u32, @intCast(i))));
     }
 
     fn fetch8(self: *Cpu) u8 {

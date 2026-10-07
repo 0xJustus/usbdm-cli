@@ -37,6 +37,69 @@ pub const Image = struct {
         for (self.segments) |seg| n += seg.data.len;
         return n;
     }
+
+    /// The byte the image defines at `addr`, or null if it does not cover it.
+    pub fn byteAt(self: Image, addr: u32) ?u8 {
+        for (self.segments) |seg| {
+            if (addr >= seg.addr and addr - seg.addr < seg.data.len) return seg.data[addr - seg.addr];
+        }
+        return null;
+    }
+
+    /// True if any segment overlaps the inclusive range [lo, hi].
+    pub fn overlaps(self: Image, lo: u32, hi: u32) bool {
+        for (self.segments) |seg| {
+            if (seg.data.len == 0) continue;
+            const end = seg.addr + @as(u32, @intCast(seg.data.len - 1));
+            if (seg.addr <= hi and end >= lo) return true;
+        }
+        return false;
+    }
+
+    /// Define one byte, overwriting it if the image covers `addr`, otherwise
+    /// inserting it (merged with an adjacent segment so the invariant of sorted,
+    /// non-overlapping, non-adjacent segments holds). `gpa` must own the image.
+    pub fn setByte(self: *Image, gpa: Allocator, addr: u32, value: u8) Allocator.Error!void {
+        for (self.segments) |seg| {
+            if (addr >= seg.addr and addr - seg.addr < seg.data.len) {
+                seg.data[addr - seg.addr] = value;
+                return;
+            }
+        }
+        var list: std.ArrayList(Segment) = .empty;
+        errdefer list.deinit(gpa);
+        var inserted = false;
+        for (self.segments) |seg| {
+            if (!inserted and seg.addr > addr) {
+                try list.append(gpa, .{ .addr = addr, .data = try gpa.dupe(u8, &.{value}) });
+                inserted = true;
+            }
+            try list.append(gpa, seg);
+        }
+        if (!inserted) try list.append(gpa, .{ .addr = addr, .data = try gpa.dupe(u8, &.{value}) });
+
+        // Merge neighbours that now touch.
+        var out: std.ArrayList(Segment) = .empty;
+        errdefer out.deinit(gpa);
+        for (list.items) |seg| {
+            if (out.items.len > 0) {
+                const prev = &out.items[out.items.len - 1];
+                if (prev.addr + @as(u32, @intCast(prev.data.len)) == seg.addr) {
+                    const joined = try gpa.alloc(u8, prev.data.len + seg.data.len);
+                    @memcpy(joined[0..prev.data.len], prev.data);
+                    @memcpy(joined[prev.data.len..], seg.data);
+                    gpa.free(prev.data);
+                    gpa.free(seg.data);
+                    prev.data = joined;
+                    continue;
+                }
+            }
+            try out.append(gpa, seg);
+        }
+        list.deinit(gpa);
+        gpa.free(self.segments);
+        self.segments = try out.toOwnedSlice(gpa);
+    }
 };
 
 pub const ParseError = error{
@@ -592,4 +655,35 @@ test "fuzz: hexfile.parse never panics or leaks on adversarial input" {
             m.deinit(gpa);
         } else |_| {}
     }
+}
+
+test "Image.setByte inserts, merges neighbours and overwrites" {
+    const gpa = std.testing.allocator;
+    var img = try parse(gpa, "S1050010AABB85\nS1050020CCDD31\nS9030000FC\n");
+    defer img.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), img.segments.len);
+    try std.testing.expectEqual(@as(?u8, 0xAA), img.byteAt(0x10));
+    try std.testing.expectEqual(@as(?u8, null), img.byteAt(0x12));
+    try std.testing.expect(img.overlaps(0x11, 0x30));
+    try std.testing.expect(!img.overlaps(0x12, 0x1F));
+
+    try img.setByte(gpa, 0x11, 0x55); // overwrite in place
+    try std.testing.expectEqual(@as(?u8, 0x55), img.byteAt(0x11));
+    try std.testing.expectEqual(@as(usize, 2), img.segments.len);
+
+    try img.setByte(gpa, 0x12, 0x77); // touches the first segment: merged
+    try std.testing.expectEqual(@as(usize, 2), img.segments.len);
+    try std.testing.expectEqual(@as(usize, 3), img.segments[0].data.len);
+
+    try img.setByte(gpa, 0x40, 0x01); // after everything: new segment
+    try img.setByte(gpa, 0x05, 0x02); // before everything: new first segment
+    try std.testing.expectEqual(@as(usize, 4), img.segments.len);
+    try std.testing.expectEqual(@as(u32, 0x05), img.segments[0].addr);
+
+    try img.setByte(gpa, 0x1F, 0x00); // bridges nothing yet
+    try img.setByte(gpa, 0x13, 0x00);
+    // 0x10..0x13 contiguous, 0x1F separate, 0x20.. contiguous with 0x1F -> merged
+    try std.testing.expectEqual(@as(u32, 0x1F), img.segments[2].addr);
+    try std.testing.expectEqual(@as(usize, 3), img.segments[2].data.len);
+    try std.testing.expectEqual(@as(u32, 0x40), img.segments[3].addr);
 }

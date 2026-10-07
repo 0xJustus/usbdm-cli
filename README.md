@@ -49,16 +49,46 @@ behave as on-target. USB-only commands (`probe`/`version`/`list`) are declined.
 ## Flash programming
 
 Reference RAM flash-routine method: vendored routines run on the target CPU.
-Geometry (`--part`) comes from a build-time table of 188 parts (vendored USBDM
-device DB), which also backs `identify`. Families: HCS08/RS08, HCS12, CFV1, plus
-S12G EEPROM. Destructive commands confirm unless `--force`.
+Geometry (`--part`) comes from a build-time table of 193 parts (vendored USBDM
+device DB), which also backs `identify`. Families: HCS08/RS08, HCS12 (classic S12,
+S12G, and S12XE/XS/XF on the paged map), CFV1, plus S12G EEPROM. Destructive
+commands confirm unless `--force`. HCS12 flash operations start with a
+special-mode reset, so the target does not need to be halted first.
+
+### HCS08 flash bring-up and oscillator trim
+
+Before the routine runs, an HCS08 flash command does what `UsbdmFlashProgrammer` does:
+a software special reset and halt (the device DB's default), COP off (`SOPT`), the ICS
+clock set to a known speed, and `FCDIV` loaded from the *measured* bus clock (the BDC is
+switched to the bus clock, `CLKSW=1`, so the pod's speed reading is the bus). `FCDIV` is
+write-once per reset, which is why this has to come first.
+
+The oscillator trim (`NVFTRIM`/`NVTRIM`, 0xFFAE/0xFFAF on ICS parts) lives in the same
+sector as the vectors, so programming a normal image erases it and the part then runs
+~30 % slow. Two ways to keep it:
+
+- by default the chip's own trim bytes are copied into the image before the erase
+  (only where the image leaves them unset);
+- `--trim <kHz>` re-trims: the BDM clock is measured at a low speed while the trim is
+  searched (binary search, then a +/-8 sweep with a least-squares fit), and the result is
+  written into the image. `--part` is required. The frequency is the *internal reference*
+  (e.g. 33.6 for an 8.6016 MHz bus on an ICSV2 part); `--nvloc <addr>` overrides where the
+  two bytes go (default by clock type, from USBDM's DeviceData.cpp).
+
+```
+usbdm program app.s19 --part mc9s08sh16 --trim 33.6
+```
+
+Trim is implemented for the ICS clock variants (tested on ICSV2, MC9S08SH16); ICG and MCG
+parts get the preserve-by-default behaviour only. A mass erase (`erase`, `unsecure`)
+removes the trim and says so.
 
 ## GDB remote stub
 
 `usbdm gdb` serves the GDB remote protocol over TCP: registers, memory,
 single-step, `continue`/`vCont`, flash `load` (`vFlash*`), `monitor reset`/`halt`.
-Hardware breakpoints on HCS08, classic-S12 HCS12, and CFV1; S12G and watchpoints
-use GDB software breakpoints.
+Hardware breakpoints on HCS08, classic-S12 HCS12, and CFV1; S12G, S12X and
+watchpoints use GDB software breakpoints.
 
 ## Layout
 

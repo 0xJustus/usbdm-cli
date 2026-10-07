@@ -24,7 +24,7 @@ pub const sdid_table = gen.sdid_table;
 /// Family generics (not in the XML): used when no --part is named, so a
 /// non-HCS08 target isn't handed HCS08 geometry.
 pub const generics = [_]Device{
-    .{ .name = "hcs08-generic", .ram_start = 0x80, .ram_end = 0x27F, .flash_start = 0x8000, .flash_end = 0xFFFF },
+    .{ .name = "hcs08-generic", .ram_start = 0x80, .ram_end = 0x27F, .flash_start = 0x8000, .flash_end = 0xFFFF, .sopt_addr = 0x1802 },
     .{ .name = "hcs12-generic", .family = .hcs12, .flash_base = 0x0100, .ram_start = 0x0800, .ram_end = 0x0FFF, .flash_start = 0x4000, .flash_end = 0x7FFF, .flash_start2 = 0xC000, .flash_end2 = 0xFFFF, .page_size = 512, .write_align = 2, .security_addr = 0xFF0F, .watchdog_addr = 0x003C, .hcs12_routine = .mmcv4_fts },
     .{ .name = "cfv1-generic", .family = .cfv1, .flash_base = 0xFF9820, .ram_start = 0x00800000, .ram_end = 0x00801FFF, .flash_start = 0x0, .flash_end = 0x1FFFF, .page_size = 1024, .write_align = 4, .security_addr = 0x40F, .watchdog_addr = 0xFF9802 },
 };
@@ -101,6 +101,20 @@ test "generated HCS08 table: geometry and routine-blob selection" {
     try std.testing.expectEqual(@as(u32, 8), g240.write_align);
     try std.testing.expectEqual(@as(u32, 0x1400), g240.ram_start);
     try std.testing.expectEqual(@as(u32, 0x100), g240.eeprom.?.sector); // erase sector, not the XML phrase size
+    // S12XE: XMMC/XFTMRK, FTM at 0x0100, PPAGE-banked C0..FF from pages="1024K".
+    const xep = lookup("mc9s12xep100-family").?;
+    try std.testing.expectEqual(Hcs12Routine.xmmc_xftmrk, xep.hcs12_routine);
+    try std.testing.expectEqual(@as(u32, 0x0100), xep.flash_base);
+    try std.testing.expectEqual(@as(u32, 8), xep.write_align);
+    try std.testing.expectEqual(@as(u32, 1024), xep.page_size);
+    try std.testing.expectEqual(@as(u16, 0x0015), xep.paged.?.ppage_addr);
+    try std.testing.expectEqual(@as(u8, 0xC0), xep.paged.?.page_first);
+    try std.testing.expectEqual(@as(u8, 0xFF), xep.paged.?.page_last);
+    try std.testing.expect(xep.spanInFlash(0xFA8000, 0xFABFFF) and xep.spanInFlash(0xC000, 0xFFFF));
+    // Size-derived page count, not the 0xFE reset page: XS256 is 16 pages.
+    try std.testing.expectEqual(@as(u8, 0xF0), lookup("mc9s12xs256").?.paged.?.page_first);
+    // The linear-map entry stays out: its window is not reachable by the paged routine.
+    try std.testing.expect(lookup("mc9s12xep-linear") == null);
 }
 
 test "generated device table: known parts resolve with sane geometry" {

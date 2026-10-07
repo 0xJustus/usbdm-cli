@@ -151,7 +151,31 @@ pub const CpuBackend = union(enum) {
     }
 };
 
+/// A model of an ICS clock for the speed the pod reports, so the flash bring-up and trim
+/// search can run in the simulator: bus = reference x FLL / BDIV / 2, the reference
+/// following ICSTRM/FTRIM (a larger trim is slower) and BDIV following ICSC2[7:6].
+/// This is the BDM clock with CLKSW=1.
+pub const IcsModel = struct {
+    base: u32,
+    /// FLL multiplier at DRS=0 (1024 on ICSV2, 512 on ICSV1/V3).
+    fll: f64 = 1024,
+    /// Reference at trim 256 (TRIM 0x80, FTRIM 0).
+    irc_hz: f64 = 33_700,
+    /// Fractional frequency change per trim step.
+    slope: f64 = -0.0019,
+
+    pub fn busHz(self: IcsModel, sim: *Sim) f64 {
+        const c2 = sim.memGet(self.base + 1);
+        const trim: f64 = @floatFromInt((@as(u32, sim.memGet(self.base + 2)) << 1) | (sim.memGet(self.base + 3) & 1));
+        const bdiv: f64 = @floatFromInt(@as(u32, 1) << @intCast(c2 >> 6));
+        const irc = self.irc_hz * (1.0 + self.slope * (trim - 256.0));
+        return irc * self.fll / bdiv / 2.0;
+    }
+};
+
 pub const Sim = struct {
+    /// When set, the speed the pod reports follows the target's ICS registers.
+    ics: ?IcsModel = null,
     gpa: std.mem.Allocator,
     dev: device.Device,
     mem: std.AutoHashMap(u32, u8),
@@ -387,6 +411,12 @@ pub const Sim = struct {
             },
             .connect => self.connected = true,
             .target_reset, .target_halt => {
+                if (cmd == .target_reset) {
+                    if (self.cpu) |c| switch (c) {
+                        .hcs08 => |cp| cp.resetFlashRegs(),
+                        else => {},
+                    };
+                }
                 self.halted = true;
                 if (self.cpu) |c| c.setHalted(true); // keep core status in sync
             },
@@ -402,6 +432,7 @@ pub const Sim = struct {
             },
             .set_speed => self.speed_sync = rd16p(p),
             .get_speed => {
+                if (self.ics) |m| self.speed_sync = @import("session.zig").hzToSync(@intFromFloat(m.busHz(self))) catch self.speed_sync;
                 std.mem.writeInt(u16, scratch[0..2], self.speed_sync, .big);
                 data = scratch[0..2];
             },

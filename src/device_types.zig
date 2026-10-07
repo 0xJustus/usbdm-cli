@@ -6,8 +6,8 @@ const std = @import("std");
 /// Flash family - selects the RAM routine + ABI (HCS08 small-code, HCS12 large-code).
 pub const Family = enum { hcs08, hcs12, cfv1 };
 
-/// HCS12 routine: classic S12 = MMCV4/FTS, S12G = GMMC/FTMRG.
-pub const Hcs12Routine = enum { mmcv4_fts, gmmc_ftmrg };
+/// HCS12 routine: classic S12 = MMCV4/FTS, S12G = GMMC/FTMRG, S12XE = XMMC/XFTMRK.
+pub const Hcs12Routine = enum { mmcv4_fts, gmmc_ftmrg, xmmc_xftmrk };
 
 /// PPAGE-banked HCS12 flash. Window always 0x8000-0xBFFF; pages
 /// page_first..page_last map globally as (page << 16) | offset (routine sets
@@ -22,6 +22,30 @@ pub const Eeprom = struct { base_global: u32, size: u32, sector: u32, align_byte
 /// OR'd into an EEPROM address so GMMC treats it as a global "linear" address
 /// (-> D-flash commands 0x11/0x12, not PPAGE/P-flash).
 pub const eeprom_linear_flag: u32 = 0x8000_0000;
+
+/// Internal clock generator, from the device DB's `<clock type=..>`. Decides how
+/// the target clock is configured for flash programming and trimmed (clock.zig).
+/// `other` = a type the DB has but nothing here supports (ICG, MCG, ...); such
+/// parts still get their trim bytes preserved, just not re-trimmed.
+pub const ClockType = enum {
+    external,
+    ics_v1,
+    ics_v2,
+    ics_v2x512,
+    ics_v3,
+    ics_v4,
+    ics_v5,
+    icg,
+    mcg,
+    other,
+
+    pub fn isIcs(self: ClockType) bool {
+        return switch (self) {
+            .ics_v1, .ics_v2, .ics_v2x512, .ics_v3, .ics_v4, .ics_v5 => true,
+            else => false,
+        };
+    }
+};
 
 /// One SDID (System Device ID) match: read `sdid_addr` over BDM, and the part is
 /// `name` when (read & mask) == sdid.
@@ -65,6 +89,13 @@ pub const Device = struct {
     paged: ?Paged = null,
     /// EEPROM/D-flash geometry (when the routine can program it).
     eeprom: ?Eeprom = null,
+    /// Internal clock generator and the address of its first register (ICSC1 /
+    /// MCGC1 / ICGC1). HCS08 only; `external` = nothing to configure or trim.
+    clock: ClockType = .external,
+    clock_addr: u32 = 0,
+    /// SOPT1 (COP control). HCS08 flash operations write it first, as the
+    /// reference scripts do, since a running COP resets the part mid-erase.
+    sopt_addr: u32 = 0,
 
     pub fn flashLen(self: Device) u32 {
         if (self.paged) |p| return (@as(u32, p.page_last - p.page_first) + 1) * 0x4000;

@@ -170,7 +170,23 @@ const SUP_HCS08 = [_][]const u8{ "HCS08-default-flash-program", "HCS08-small-fla
 const MMCV4 = [_][]const u8{ "HCS12-MMCV4-FTS-flash-program", "HCS12-MMCV4-FTS_2-flash-program", "HCS12-MMCV4-FTS_T-flash-program" };
 const GMMC = "HCS12-GMMC-FTMRG-flash-program";
 const GMMC_EE = "HCS12-GMMC-FTMRG-eeprom-program";
+const XMMC = "HCS12-XMMC-XFTMRK-flash-program";
 const SUP_CFV1 = [_][]const u8{ "CFV1-default-FlashProgram", "CFV1-Watchdog-FlashProgram" };
+
+/// Device-DB `<clock type=..>` name -> device_types.ClockType tag.
+fn clockTag(ty: []const u8) []const u8 {
+    const map = [_][2][]const u8{
+        .{ "S08ICSV1", "ics_v1" },         .{ "S08ICSV2", "ics_v2" },
+        .{ "S08ICSV2x512", "ics_v2x512" }, .{ "S08ICSV3", "ics_v3" },
+        .{ "S08ICSV4", "ics_v4" },         .{ "S08ICSV5", "ics_v5" },
+        .{ "S08ICGV1", "icg" },            .{ "S08ICGV2", "icg" },
+        .{ "S08ICGV3", "icg" },            .{ "S08ICGV4", "icg" },
+        .{ "S08MCGV1", "mcg" },            .{ "S08MCGV2", "mcg" },
+        .{ "S08MCGV3", "mcg" },            .{ "External", "external" },
+    };
+    for (map) |m| if (std.mem.eql(u8, m[0], ty)) return m[1];
+    return "other";
+}
 
 fn inList(list: []const []const u8, s: []const u8) bool {
     for (list) |x| if (std.mem.eql(u8, x, s)) return true;
@@ -408,7 +424,7 @@ fn processFile(
 
         const supported = switch (fam) {
             .hcs08 => inList(&SUP_HCS08, rt),
-            .hcs12 => inList(&MMCV4, rt) or std.mem.eql(u8, rt, GMMC),
+            .hcs12 => inList(&MMCV4, rt) or std.mem.eql(u8, rt, GMMC) or std.mem.eql(u8, rt, XMMC),
             .cfv1 => inList(&SUP_CFV1, rt),
         };
         if (!supported) {
@@ -510,7 +526,8 @@ fn processFile(
         const flash_end2 = if (has_w2) merged[1].end else 0;
 
         const is_gmmc = fam == .hcs12 and std.mem.eql(u8, rt, GMMC);
-        const hcs12_routine: []const u8 = if (is_gmmc) "gmmc_ftmrg" else "mmcv4_fts";
+        const is_xmmc = fam == .hcs12 and std.mem.eql(u8, rt, XMMC);
+        const hcs12_routine: []const u8 = if (is_gmmc) "gmmc_ftmrg" else if (is_xmmc) "xmmc_xftmrk" else "mmcv4_fts";
         var have_paged = false;
         var pg_first: u64 = 0;
         var pg_last: u64 = 0;
@@ -521,8 +538,17 @@ fn processFile(
                 const pe = attr(b, "pageEnd");
                 if (pr != null and pe != null) {
                     saw_reset = true;
-                    const prv = parseNum(pr.?);
                     const pev = parseNum(pe.?);
+                    // MMCV4 entries give the lowest page as pageReset. XMMC ones give
+                    // the reset page (0xFE) and size the window with `pages` instead:
+                    // a byte size when >= 1024 (e.g. "1024K" -> 64 pages), else a count
+                    // (ref DeviceXmlParser memoryRange).
+                    const prv = if (is_xmmc) blk: {
+                        const pg = attr(b, "pages") orelse break :blk parseNum(pr.?);
+                        const n = parseNum(pg);
+                        const count = if (n >= 1024) n / 0x4000 else n;
+                        break :blk if (count >= 1 and count <= pev + 1) pev + 1 - count else parseNum(pr.?);
+                    } else parseNum(pr.?);
                     // paged only if pages exist below the top two fixed windows; else they cover all -> null
                     if (prv + 2 <= pev) {
                         have_paged = true;
@@ -576,6 +602,26 @@ fn processFile(
             }
         }
 
+        // HCS08: clock generator + SOPT, so flash operations can reset, disable the
+        // COP, set a known clock and (optionally) trim it. An alias with no clock of
+        // its own inherits its target's.
+        var clock_tag: []const u8 = "external";
+        var clock_addr: u64 = 0;
+        var sopt_addr: u64 = 0;
+        if (fam == .hcs08) {
+            const cbody = if (scanElem(d.body, 0, "clock") != null or target == null) d.body else tbody;
+            if (scanElem(cbody, 0, "clock")) |ce| {
+                if (attr(ce.attrs, "type")) |t| clock_tag = clockTag(t);
+                if (attr(ce.attrs, "registerAddress")) |r| clock_addr = parseNum(r);
+            }
+            sopt_addr = ctx.def.sopt;
+            if (elemAttr(d.body, "soptAddress", "value")) |x| {
+                sopt_addr = parseNum(x);
+            } else if (target != null) {
+                if (elemAttr(tbody, "soptAddress", "value")) |x| sopt_addr = parseNum(x);
+            }
+        }
+
         var have_ee = false;
         var ee_base: u64 = 0;
         var ee_size: u64 = 0;
@@ -624,6 +670,8 @@ fn processFile(
         try table_w.print(", .page_size = {d}, .write_align = {d}", .{ page_size, write_align });
         try table_w.print(", .security_addr = 0x{X}, .watchdog_addr = 0x{X}", .{ sec, watchdog });
         try table_w.print(", .hcs12_routine = .{s}", .{hcs12_routine});
+        if (fam == .hcs08)
+            try table_w.print(", .clock = .{s}, .clock_addr = 0x{X}, .sopt_addr = 0x{X}", .{ clock_tag, clock_addr, sopt_addr });
         if (have_paged) {
             try table_w.print(", .paged = .{{ .ppage_addr = 0x{X}, .page_first = 0x{X}, .page_last = 0x{X} }}", .{ page_addr, pg_first, pg_last });
         } else {
